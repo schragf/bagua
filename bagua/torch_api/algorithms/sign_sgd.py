@@ -4,6 +4,8 @@ from bagua.torch_api.tensor import BaguaTensor
 from typing import List
 import torch
 
+from bagua.torch_api import get_world_size
+from bagua.torch_api import allgather_inplace, alltoall_inplace
 import torch.distributed as dist
 import torch.multiprocessing as mp
 # compression:
@@ -71,9 +73,8 @@ class SignSGDAlgorithm(Algorithm):
                 tensor_transformed = tensor_unpacked.float().mul(2.0).sub(1.0)
                 return decompressed
 
-            # TODO: get number of workers and the rank
-            n_workers = 2
-            rank = 0
+            # get number of workers
+            n_workers = get_world_size()
 
             cat_tensor = torch.empty(0, device = 'cuda')
             # QUESTION: tensors in bucket.tensor are flattened? 1Dim? I assume not in my code
@@ -92,43 +93,40 @@ class SignSGDAlgorithm(Algorithm):
             # ASSUMPTION: all_to_all will send the last chunk to the worker with the highest rank
 
             chunk_size = math.ceil(compressed_tensor_size / n_workers)
+            # add padding to compressed_tensor, so that it can be used by bagua alltoall
             if (compressed_tensor_size % n_workers != 0):
                 chunk_padding = (chunk_size * n_workers) - compressed_tensor_size
                 sign_padding +=  chunk_padding * 8
                 compressed_tensor = torch.cat((compressed_tensor, torch.empty(chunk_padding, dtype=torch.uint8, device='cuda')))
             
-            input_list = list(compressed_tensor.chunk(n_workers))
-            output_compressed = list(torch.empty(chunk_size * n_workers), dtype=torch.uint8, device = 'cuda').chunk(n_workers))
+            send_tensor = compressed_tensor
+            alltoall_inplace(send_tensor)
+            recv_tensor = send_tensor
 
-            dist.all_to_all(output_compressed, input_list)
-
-            # Prepare the received chunk tensors for averaging
-            output_decompressed = torch.empty(0, device = 'cuda')
-            for idx, tensor in enumerate(output_compressed):
-                    output_decompressed = torch.cat((decompressed_tensors, onebit_decompression(tensor)))
+            decompressed = onebit_decompression(recv_tensor)
             
-            chunk_decompressed = torch.reshape(output_decompressed, (n_workers, chunk_size*8))
+            chunk_decompressed = torch.reshape(decompressed, (n_workers, chunk_size*8))
 
             # AVERAGE
             chunk_avg = torch.mean(chunk_decompressed, 0)
 
             _ , compressed_chunk_avg = onebit_compression(chunk_avg)
 
-            input_tensor = compressed_chunk_avg
-            output_compressed = list(torch.empty(chunk_size * n_workers),dtype=torch.uint8, device='cuda').chunk(n_workers)
+            send_tensor = compressed_chunk_avg
+            allgather_inplace(send_tensor)
+            recv_tensor = send_tensor
 
-             output_decompressed = torch.empty(0, device = 'cuda')
-            for idx, tensor in enumerate(output_compressed):
-                    output_decompressed = torch.cat((decompressed_tensors, onebit_decompression(tensor)))
+            decompressed = onebit_decompression(recv_tensor)
 
-            # UPDATE GRADIENT
-            update_tensor_cat = output_decompressed[0:output_decompressed.size - sign_padding]
+            # UPDATE BUCKET
+            # remove padding
+            update_tensor = decompressed[0:decompressed.size - sign_padding]
 
             for tensor in bucket.tensor:
                 tensor_size = tensor.numel()
                 tensor_shape = tensor.shape()
-                new_tensor = update_tensor_cat[0:tensor_size]
-                tensor = torch.reshape(new_tensor, tensor_shape)
-                update_tensor_cat = update_tensor_cat[tensor_size:]
+                new_tensor = update_tensor[0:tensor_size]
+                tensor._bagua_backend_tensor.torch_tensor = torch.reshape(new_tensor, tensor_shape)
+                update_tensor = update_tensor[tensor_size:]
         
         bucket.append_python_op(onebit_centeralized_communication)
