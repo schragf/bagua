@@ -96,9 +96,9 @@ class SignSGDAlgorithm(Algorithm):
 
             chunk_size = math.ceil(compressed_tensor_size / n_workers)
             if (compressed_tensor_size % n_workers != 0):
-                sign_padding += ((chunk_size * n_workers) - compressed_tensor_size) * 8
-                compressed_tensor = torch.cat((compressed_tensor, torch.empty(chunk_size, dtype=torch.uint8, device='cuda')))
-                # local_chunk_size = compressed_tensor_size / (local_chunk_size * n_workers-1)
+                chunk_padding = (chunk_size * n_workers) - compressed_tensor_size
+                sign_padding +=  chunk_padding * 8
+                compressed_tensor = torch.cat((compressed_tensor, torch.empty(chunk_padding, dtype=torch.uint8, device='cuda')))
             
             input_list = list(compressed_tensor.chunk(n_workers))
             output_compressed = list(torch.empty(chunk_size * n_workers), dtype=torch.uint8, device = 'cuda').chunk(n_workers))
@@ -125,9 +125,17 @@ class SignSGDAlgorithm(Algorithm):
                     output_decompressed = torch.cat((decompressed_tensors, onebit_decompression(tensor, sign_padding, needs_padding_rm)))
 
             # UPDATE GRADIENT
-            new_tensor_cat = output_decompressed[0:output_decompressed.size - sign_padding]
+            update_tensor_cat = output_decompressed[0:output_decompressed.size - sign_padding]
 
-            # TODO: update bucket tensors
+            for tensor in bucket.tensor:
+                tensor_size = tensor.numel()
+                tensor_shape = tensor.shape()
+                new_tensor = update_tensor_cat[0:tensor_size]
+                tensor = torch.reshape(new_tensor, tensor_shape)
+                update_tensor_cat = update_tensor_cat[tensor_size:]
+
+                
+            
 
             # OLD ALL_GATHER
             # needs_padding_rm = True
