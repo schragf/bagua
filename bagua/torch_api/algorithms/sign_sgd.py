@@ -36,10 +36,12 @@ class SignSGDAlgorithm(Algorithm):
 
            def onebit_compression(tensor):
                 """
-                Input: torch.tensor
                 - Compress tensor by taking the sign of each element and pack each signbit into a 8bit array
-                Output: - sign_padding: number of padding bits needed at the last element of 8bit-tensor to fit all signbits
-                        - compressed_tensor: torch.tensor (dtype=uint8)
+                Input:
+                    - tensor: torch.tensor
+                Output:
+                    - sign_padding: number of padding bits needed at the last element of 8bit-tensor to fit all signbits
+                    - compressed_tensor: torch.tensor (dtype=torch.uint8)
                 """
                 tensor_size = tensor.numel()
                 signs = torch.sign(tensor)
@@ -54,24 +56,19 @@ class SignSGDAlgorithm(Algorithm):
 
                 return sign_padding, compressed_tensor
 
-            def onebit_decompression(tensor, sign_padding, needs_padding_rm):
+            def onebit_decompression(tensor):
                 """
-                Input: torch.tensor, sign_padding (int), needs_padding_rm (bool): whether the last sign_padding number of bits have to be discarded
                 - decompress tensor by unpacking the uint8 array and transforming the values: (0 -> -1, 1 -> +1)
-                - discard the padded bits at the end
+                Input: 
+                    - tensor: torch.tensor (dtype=torch.uint8) 
                 Output: 
-                        - decompressed: torch.tensor (dtype=float32)
+                    - decompressed: torch.tensor (dtype=torch.float32)
                 """
                 tensor_cupy = cupy.fromDlpack(to_dlpack(tensor))
                 tensor_cupy_unpacked = cupy.unpackbits(tensor_cupy)
                 tensor_unpacked = tensor_cupy_unpacked.toDlpack()
                 tensor_unpacked = from_dlpack(tensor_unpacked).cuda()
                 tensor_transformed = tensor_unpacked.float().mul(2.0).sub(1.0)
-                # worker which is responsible for the last chunk of cat_tensor needs to take care of the padding
-                # if needs_padding_rm:
-                #     decompressed = tensor_transformed[0:(tensor_cupy_unpacked.size - sign_padding)]
-                # else:
-                #     decompressed = tensor_transformed
                 return decompressed
 
             # TODO: get number of workers and the rank
@@ -79,7 +76,7 @@ class SignSGDAlgorithm(Algorithm):
             rank = 0
 
             cat_tensor = torch.empty(0, device = 'cuda')
-            # QUESTION: tensors in bucket.tensor are flattened? 1Dim?
+            # QUESTION: tensors in bucket.tensor are flattened? 1Dim? I assume not in my code
             # Concatenate the tensors in the bucket
             for idx, tensor in enumerate(bucket.tensor):
                     clone_tensor = tensor.clone().detach()
@@ -108,7 +105,7 @@ class SignSGDAlgorithm(Algorithm):
             # Prepare the received chunk tensors for averaging
             output_decompressed = torch.empty(0, device = 'cuda')
             for idx, tensor in enumerate(output_compressed):
-                    output_decompressed = torch.cat((decompressed_tensors, onebit_decompression(tensor, sign_padding, needs_padding_rm)))
+                    output_decompressed = torch.cat((decompressed_tensors, onebit_decompression(tensor)))
             
             chunk_decompressed = torch.reshape(output_decompressed, (n_workers, chunk_size*8))
 
@@ -122,7 +119,7 @@ class SignSGDAlgorithm(Algorithm):
 
              output_decompressed = torch.empty(0, device = 'cuda')
             for idx, tensor in enumerate(output_compressed):
-                    output_decompressed = torch.cat((decompressed_tensors, onebit_decompression(tensor, sign_padding, needs_padding_rm)))
+                    output_decompressed = torch.cat((decompressed_tensors, onebit_decompression(tensor)))
 
             # UPDATE GRADIENT
             update_tensor_cat = output_decompressed[0:output_decompressed.size - sign_padding]
@@ -133,26 +130,5 @@ class SignSGDAlgorithm(Algorithm):
                 new_tensor = update_tensor_cat[0:tensor_size]
                 tensor = torch.reshape(new_tensor, tensor_shape)
                 update_tensor_cat = update_tensor_cat[tensor_size:]
-
-                
-            
-
-            # OLD ALL_GATHER
-            # needs_padding_rm = True
-            # output_compressed = list (torch.empty(compressed_tensor.numel() * n_workers), dtype=torch.uint8, device = 'cuda').chunk(n_workers))
-            
-            # dist.all_gather(output_compressed, compressed_tensor)
-            
-
-            # output_decompressed = torch.empty(0, device = 'cuda')
-            # for idx, tensor in enumerate(output_compressed):
-            #         output_decompressed = torch.cat((decompressed_tensors, onebit_decompression(tensor, sign_padding, needs_padding_rm)))
-            
-            # output_decompressed = torch.reshape(output_decompressed, (n_workers, cat_tensor_size))
-
-            # # AVERAGING
-            # averaged_tensor = torch.mean(output_decompressed, 0)
-
-            # TODO: UPDATE GRADIENTS
         
         bucket.append_python_op(onebit_centeralized_communication)
