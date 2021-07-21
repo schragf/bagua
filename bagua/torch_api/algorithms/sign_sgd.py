@@ -23,20 +23,20 @@ class SignSGDAlgorithm(Algorithm):
         bagua_module: BaguaModule,
         bucket: BaguaBucket,
     ):
-    """
-    concatenate the bucket tensors,
-    compress the tensor (1bit/sign compression),
-    communicate via all_to_all,
-    decompress the tensor,
-    average over the tensor,
-    communicated average via all_gather,
-    update the bucket tensors
-    """
+        """
+        concatenate all the tensors of a bucket (cat_tensor),
+        compress the tensor (1bit/sign compression),
+        communicate via bagua backend all_to_all,
+        decompress the received tensor,
+        average the tensor,
+        communicated average via bagua backend all_gather,
+        update the bucket tensors
+        """
         bucket.clear_ops()
 
         def onebit_centeralized_communication(*args):
 
-           def onebit_compression(tensor):
+            def onebit_compression(tensor):
                 """
                 - Compress tensor by taking the sign of each element and pack each signbit into a 8bit array
                 Input:
@@ -61,27 +61,26 @@ class SignSGDAlgorithm(Algorithm):
             def onebit_decompression(tensor):
                 """
                 - decompress tensor by unpacking the uint8 array and transforming the values: (0 -> -1, 1 -> +1)
-                Input: 
-                    - tensor: torch.tensor (dtype=torch.uint8) 
-                Output: 
+                Input:
+                    - tensor: torch.tensor (dtype=torch.uint8)
+                Output:
                     - decompressed: torch.tensor (dtype=torch.float32)
                 """
                 tensor_cupy = cupy.fromDlpack(to_dlpack(tensor))
                 tensor_cupy_unpacked = cupy.unpackbits(tensor_cupy)
                 tensor_unpacked = tensor_cupy_unpacked.toDlpack()
                 tensor_unpacked = from_dlpack(tensor_unpacked).cuda()
-                tensor_transformed = tensor_unpacked.float().mul(2.0).sub(1.0)
+                decompressed = tensor_unpacked.float().mul(2.0).sub(1.0)
                 return decompressed
 
             # get number of workers
             n_workers = get_world_size()
 
-            cat_tensor = torch.empty(0, device = 'cuda')
-            # QUESTION: tensors in bucket.tensor are flattened? 1Dim? I assume not in my code
+            cat_tensor = torch.empty(0, device='cuda')
             # Concatenate the tensors in the bucket
             for idx, tensor in enumerate(bucket.tensor):
-                    clone_tensor = tensor.clone().detach()
-                    cat_tensor = torch.cat((cat_tensor, clone_tensor.flatten()))
+                clone_tensor = tensor.clone().detach()
+                cat_tensor = torch.cat((cat_tensor, clone_tensor.flatten()))
 
             cat_tensor_size = cat_tensor.numel()
 
@@ -95,22 +94,25 @@ class SignSGDAlgorithm(Algorithm):
             chunk_size = math.ceil(compressed_tensor_size / n_workers)
             # add padding to compressed_tensor, so that it can be used by bagua alltoall
             if (compressed_tensor_size % n_workers != 0):
-                chunk_padding = (chunk_size * n_workers) - compressed_tensor_size
-                sign_padding +=  chunk_padding * 8
-                compressed_tensor = torch.cat((compressed_tensor, torch.empty(chunk_padding, dtype=torch.uint8, device='cuda')))
-            
+                chunk_padding = (chunk_size * n_workers) - \
+                    compressed_tensor_size
+                sign_padding += chunk_padding * 8
+                compressed_tensor = torch.cat((compressed_tensor, torch.empty(
+                    chunk_padding, dtype=torch.uint8, device='cuda')))
+
             send_tensor = compressed_tensor
             alltoall_inplace(send_tensor)
             recv_tensor = send_tensor
 
             decompressed = onebit_decompression(recv_tensor)
-            
-            chunk_decompressed = torch.reshape(decompressed, (n_workers, chunk_size*8))
+
+            chunk_decompressed = torch.reshape(
+                decompressed, (n_workers, chunk_size*8))
 
             # AVERAGE
             chunk_avg = torch.mean(chunk_decompressed, 0)
 
-            _ , compressed_chunk_avg = onebit_compression(chunk_avg)
+            _, compressed_chunk_avg = onebit_compression(chunk_avg)
 
             send_tensor = compressed_chunk_avg
             allgather_inplace(send_tensor)
@@ -120,13 +122,15 @@ class SignSGDAlgorithm(Algorithm):
 
             # UPDATE BUCKET
             # remove padding
-            update_tensor = decompressed[0:decompressed.size - sign_padding]
+            padding = decompressed.numel() - sign_padding
+            update_tensor = decompressed[0:padding]
 
             for tensor in bucket.tensor:
                 tensor_size = tensor.numel()
-                tensor_shape = tensor.shape()
+                tensor_shape = tensor.shape
                 new_tensor = update_tensor[0:tensor_size]
-                tensor._bagua_backend_tensor.torch_tensor = torch.reshape(new_tensor, tensor_shape)
+                tensor._bagua_backend_tensor.torch_tensor.set_(
+                    torch.reshape(new_tensor, tensor_shape))
                 update_tensor = update_tensor[tensor_size:]
-        
+
         bucket.append_python_op(onebit_centeralized_communication)
