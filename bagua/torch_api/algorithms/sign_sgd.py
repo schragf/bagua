@@ -29,7 +29,10 @@ class SignSGDAlgorithm(Algorithm):
         communicate via bagua backend all_to_all,
         decompress the received tensor,
         average the tensor,
+        compress the tensor (1bit/sign compression),
         communicated average via bagua backend all_gather,
+        decompress the received tensor,
+        remove padding,
         update the bucket tensors
         """
         bucket.clear_ops()
