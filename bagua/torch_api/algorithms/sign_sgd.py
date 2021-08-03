@@ -82,7 +82,7 @@ class SignSGDAlgorithm(Algorithm):
 
             cat_tensor = torch.empty(0, device='cuda')
             # Concatenate the tensors in the bucket
-            for idx, tensor in enumerate(bucket.tensor):
+            for idx, tensor in enumerate(bucket.tensors):
                 clone_tensor = tensor.clone().detach()
                 cat_tensor = torch.cat((cat_tensor, clone_tensor.flatten()))
 
@@ -129,7 +129,7 @@ class SignSGDAlgorithm(Algorithm):
             padding = decompressed.numel() - sign_padding
             update_tensor = decompressed[0:padding]
 
-            for tensor in bucket.tensor:
+            for tensor in bucket.tensors:
                 tensor_size = tensor.numel()
                 tensor_shape = tensor.shape
                 new_tensor = update_tensor[0:tensor_size]
