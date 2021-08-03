@@ -1,6 +1,7 @@
 from bagua.torch_api.distributed import BaguaModule
 from bagua.torch_api.bucket import BaguaBucket
 from bagua.torch_api.tensor import BaguaTensor
+from bagua.torch_api.algorithms import Algorithm
 from typing import List
 import torch
 
