@@ -4,9 +4,10 @@ from bagua.torch_api.tensor import BaguaTensor
 from bagua.torch_api.algorithms import Algorithm
 from typing import List
 import torch
+import bagua_core as B
 
 from bagua.torch_api import get_world_size
-from bagua.torch_api import allgather_inplace, alltoall_inplace
+from bagua.torch_api import allgather_inplace, alltoall_inplace, allgather
 import torch.distributed as dist
 import torch.multiprocessing as mp
 # compression:
@@ -49,6 +50,7 @@ class SignSGDAlgorithm(Algorithm):
                     - sign_padding: number of padding bits needed at the last element of 8bit-tensor to fit all signbits
                     - compressed_tensor: torch.tensor (dtype=torch.uint8)
                 """
+
                 tensor_size = tensor.numel()
                 signs = torch.sign(tensor)
                 signs_binary = signs.add(1.0).bool()
@@ -97,6 +99,7 @@ class SignSGDAlgorithm(Algorithm):
 
             chunk_size = math.ceil(compressed_tensor_size / n_workers)
             # add padding to compressed_tensor, so that it can be used by bagua alltoall
+
             if (compressed_tensor_size % n_workers != 0):
                 chunk_padding = (chunk_size * n_workers) - \
                     compressed_tensor_size
@@ -105,6 +108,7 @@ class SignSGDAlgorithm(Algorithm):
                     chunk_padding, dtype=torch.uint8, device='cuda')))
 
             send_tensor = compressed_tensor
+
             alltoall_inplace(send_tensor)
             recv_tensor = send_tensor
 
@@ -119,8 +123,13 @@ class SignSGDAlgorithm(Algorithm):
             _, compressed_chunk_avg = onebit_compression(chunk_avg)
 
             send_tensor = compressed_chunk_avg
-            allgather_inplace(send_tensor)
-            recv_tensor = send_tensor
+
+            # allgather_inplace(send_tensor)
+            temp = send_tensor.numel()*n_workers
+            recv_tensor = torch.empty(
+                temp, dtype=torch.uint8, device='cuda')
+
+            allgather(send_tensor, recv_tensor)
 
             decompressed = onebit_decompression(recv_tensor)
 
@@ -133,8 +142,18 @@ class SignSGDAlgorithm(Algorithm):
                 tensor_size = tensor.numel()
                 tensor_shape = tensor.shape
                 new_tensor = update_tensor[0:tensor_size]
-                tensor._bagua_backend_tensor.torch_tensor.set_(
-                    torch.reshape(new_tensor, tensor_shape))
+                # tensor._bagua_backend_tensor.torch_tensor.set_(
+                #     torch.reshape(new_tensor, tensor_shape))
+                tensor._bagua_backend_tensor = B.BaguaTensorPy(
+                    name=tensor.bagua_tensor_name,
+                    torch_tensor=torch.reshape(new_tensor, tensor_shape),
+                )
                 update_tensor = update_tensor[tensor_size:]
+
+            del cat_tensor
+            del compressed_tensor
+            del send_tensor
+            del recv_tensor
+            torch.cuda.empty_cache()
 
         bucket.append_python_op(onebit_centeralized_communication)
