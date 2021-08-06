@@ -20,6 +20,22 @@ import math
 
 class SignSGDAlgorithm(Algorithm):
 
+    # def __init__(self, compression_start: int = 100):
+    #     self.compression_start = compression_start
+    #     self.step_id = 0
+
+    # def init_post_optimizer_step_hook(self, bagua_module: BaguaModule):
+    #     def hook(optimizer: torch.optim.Optimizer):
+    #         self.step_id = self.step_id + 1
+    #     return hook
+
+    # def need_reset(self):
+    #     if self.step_id == self.compression_start:
+    #         print(
+    #             "SignSGD starts to compress from step {}".format(self.step_id)
+    #         )
+    #     return False
+
     def init_operations(
         self,
         bagua_module: BaguaModule,
@@ -38,6 +54,12 @@ class SignSGDAlgorithm(Algorithm):
         update the bucket tensors
         """
         bucket.clear_ops()
+        # if self.step_id < self.compression_start:
+        #     bucket.append_centralized_synchronous_op(
+        #         hierarchical=False,
+        #         average=True,
+        #     )
+        # else:
 
         def onebit_centeralized_communication(*args):
 
@@ -82,16 +104,20 @@ class SignSGDAlgorithm(Algorithm):
             # get number of workers
             n_workers = get_world_size()
 
-            cat_tensor = torch.empty(0, device='cuda')
+            #cat_tensor = torch.empty(0, device='cuda')
+            cat_tensor = torch.empty(
+                0, device='cuda:{}'.format(torch.cuda.current_device()))
             # Concatenate the tensors in the bucket
-            for idx, tensor in enumerate(bucket.tensors):
+            for tensor in bucket.tensors:
                 clone_tensor = tensor.clone().detach()
-                cat_tensor = torch.cat((cat_tensor, clone_tensor.flatten()))
+                cat_tensor = torch.cat(
+                    (cat_tensor, clone_tensor.flatten()))
 
             cat_tensor_size = cat_tensor.numel()
 
-            sign_padding, compressed_tensor = onebit_compression(cat_tensor)
-
+            sign_padding, compressed_tensor = onebit_compression(
+                cat_tensor)
+            del cat_tensor
             compressed_tensor_size = compressed_tensor.numel()
 
             # COMMUNICATION
@@ -105,33 +131,36 @@ class SignSGDAlgorithm(Algorithm):
                     compressed_tensor_size
                 sign_padding += chunk_padding * 8
                 compressed_tensor = torch.cat((compressed_tensor, torch.empty(
-                    chunk_padding, dtype=torch.uint8, device='cuda')))
+                    chunk_padding, dtype=torch.uint8, device='cuda:{}'.format(torch.cuda.current_device()))))
 
             send_tensor = compressed_tensor
-
+            del compressed_tensor
             alltoall_inplace(send_tensor)
             recv_tensor = send_tensor
+            del send_tensor
 
             decompressed = onebit_decompression(recv_tensor)
+            del recv_tensor
 
             chunk_decompressed = torch.reshape(
                 decompressed, (n_workers, chunk_size*8))
-
+            del decompressed
             # AVERAGE
             chunk_avg = torch.mean(chunk_decompressed, 0)
 
             _, compressed_chunk_avg = onebit_compression(chunk_avg)
-
+            del chunk_avg
             send_tensor = compressed_chunk_avg
 
             # allgather_inplace(send_tensor)
             temp = send_tensor.numel()*n_workers
             recv_tensor = torch.empty(
-                temp, dtype=torch.uint8, device='cuda')
+                temp, dtype=torch.uint8, device='cuda:{}'.format(torch.cuda.current_device()))
 
             allgather(send_tensor, recv_tensor)
-
+            del send_tensor
             decompressed = onebit_decompression(recv_tensor)
+            del recv_tensor
 
             # UPDATE BUCKET
             # remove padding
@@ -149,11 +178,17 @@ class SignSGDAlgorithm(Algorithm):
                     torch_tensor=torch.reshape(new_tensor, tensor_shape),
                 )
                 update_tensor = update_tensor[tensor_size:]
-
-            del cat_tensor
-            del compressed_tensor
-            del send_tensor
-            del recv_tensor
-            torch.cuda.empty_cache()
-
+            # torch.cuda.empty_cache()
         bucket.append_python_op(onebit_centeralized_communication)
+
+
+# first internode allreduce on the nodes
+# and then gpu0 alltoall allgather
+# and broadcast to other local
+
+# accuracy - cifar10 - vgg16 or resnet50
+# bert? model is more complicated
+
+
+# at least more than 8 GPUs
+# 8 GPUs with 4 nodes
